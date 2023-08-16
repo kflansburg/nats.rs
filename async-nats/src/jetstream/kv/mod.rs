@@ -845,6 +845,33 @@ impl Store {
 
         Ok(Keys { inner: entries })
     }
+
+    pub async fn entries(&self) -> Result<Entries, HistoryError> {
+        let subject = format!("{}>", self.prefix.as_str());
+
+        let consumer = self
+            .stream
+            .create_consumer(super::consumer::push::OrderedConfig {
+                deliver_subject: self.stream.context.client.new_inbox(),
+                description: Some("kv history consumer".to_string()),
+                filter_subject: subject,
+                headers_only: false,
+                replay_policy: super::consumer::ReplayPolicy::Instant,
+                // We only need to know the latest state for each key, not the whole history
+                deliver_policy: DeliverPolicy::LastPerSubject,
+                ..Default::default()
+            })
+            .await?;
+
+        let entries = History {
+            done: consumer.info.num_pending == 0,
+            subscription: consumer.messages().await?,
+            prefix: self.prefix.clone(),
+            bucket: self.name.clone(),
+        };
+
+        Ok(Entries { inner: entries })
+    }
 }
 
 /// A structure representing a watch on a key-value bucket, yielding values whenever there are changes.
@@ -984,6 +1011,38 @@ impl<'a> futures::Stream for Keys<'a> {
                             continue;
                         } else {
                             return Poll::Ready(Some(Ok(entry.key)));
+                        }
+                    }
+                    Err(e) => return Poll::Ready(Some(Err(e))),
+                },
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+pub struct Entries<'a> {
+    inner: History<'a>,
+}
+
+impl<'a> futures::Stream for Entries<'a> {
+    type Item = Result<Entry, WatcherError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            match self.inner.poll_next_unpin(cx) {
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(res)) => match res {
+                    Ok(entry) => {
+                        // Skip purged and deleted keys
+                        if matches!(entry.operation, Operation::Purge | Operation::Delete) {
+                            // Try to poll again if we skip this one
+                            continue;
+                        } else {
+                            return Poll::Ready(Some(Ok(entry)));
                         }
                     }
                     Err(e) => return Poll::Ready(Some(Err(e))),
